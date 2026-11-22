@@ -1,0 +1,70 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    // ── Peran staf: dokumen staff/{uid} {email, name, role: 'guru'|'admin', off} ──
+    function signed() { return request.auth != null; }
+    function staffDoc() { return get(/databases/$(db)/documents/staff/$(request.auth.uid)); }
+    function isStaff() { return signed() && exists(/databases/$(db)/documents/staff/$(request.auth.uid)) && staffDoc().data.get('off', false) != true; }
+    function isRole(r) { return isStaff() && staffDoc().data.role == r; }
+
+    // ── Kepemilikan kode siswa: roster/{code}.uid harus sama dengan akun yang sedang masuk ──
+    function ownsCode(code) {
+      return signed()
+        && exists(/databases/$(db)/documents/roster/$(code))
+        && get(/databases/$(db)/documents/roster/$(code)).data.uid == request.auth.uid
+        && get(/databases/$(db)/documents/roster/$(code)).data.get('off', false) != true
+        && get(/databases/$(db)/documents/roster/$(code)).data.get('delReq', null) == null;
+    }
+
+    // Akun staf: staf membaca dokumennya sendiri; Admin mengelola semua.
+    match /staff/{uid} {
+      allow read: if signed() && (request.auth.uid == uid || isRole('admin'));
+      allow create, update, delete: if isRole('admin');
+    }
+
+    // Konten publik: semua boleh membaca; hanya Admin yang menulis.
+    match /careers/{id}       { allow read: if true; allow write: if isRole('admin'); }
+    match /items/{id}         { allow read: if true; allow write: if isRole('admin'); }
+    match /announcements/{id} { allow read: if true; allow write: if isRole('admin'); }
+    match /classes/{id}       { allow read: if true; allow write: if isRole('admin'); }
+
+    // Daftar kode siswa (hanya kode, kelas, uid akun, status). TIDAK berisi jawaban.
+    // Admin mengelola; siswa hanya membaca dokumennya sendiri dan menandai 'filled' / 'delReq'.
+    match /roster/{code} {
+      allow read: if isRole('admin') || (signed() && resource.data.uid == request.auth.uid);
+      allow create, delete: if isRole('admin');
+      allow update: if isRole('admin')
+        || (signed() && resource.data.uid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['filled', 'delReq']));
+    }
+
+    // Isi refleksi siswa (jawaban, skor, rencana): hanya pemilik kode. Staf tidak dapat membaca.
+    match /students/{code} {
+      allow read, write: if ownsCode(code);
+    }
+
+    // Data agregat tanpa kode siswa; id acak. Guru membaca; siswa menulis miliknya.
+    // Batas minimal 5 siswa ditegakkan di antarmuka Panel Guru (rules tidak dapat menghitung jumlah).
+    match /entries/{eid} {
+      allow read: if isRole('guru');
+      allow create, update: if signed() && !isStaff() && request.resource.data.keys().hasOnly(['cls', 'scores', 'ts']);
+      allow delete: if (signed() && !isStaff()) || isRole('admin');
+    }
+
+    // Salinan data yang dibagikan siswa kepada Guru BK (profil dan/atau rencana).
+    match /shares/{code} {
+      allow read: if isRole('guru');
+      allow create, update, delete: if ownsCode(code);
+    }
+
+    // Permintaan konsultasi: dibuat siswa; dibaca Guru dan pemiliknya; Guru hanya mengubah status dan catatan.
+    match /consults/{id} {
+      allow create: if ownsCode(request.resource.data.code);
+      allow read: if isRole('guru') || ownsCode(resource.data.code);
+      allow update: if (isRole('guru') && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'note']))
+        || (ownsCode(resource.data.code) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['shared']));
+      allow delete: if ownsCode(resource.data.code);
+    }
+  }
+}
